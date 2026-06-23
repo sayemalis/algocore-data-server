@@ -25,7 +25,7 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3001;
-const TIMEFRAMES = { "15m": 900, "1h": 3600, "4h": 14400 }; // interval -> seconds, extend as needed
+const TIMEFRAMES = { "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
 const CANDLE_LIMIT = 200;
 
 const app = express();
