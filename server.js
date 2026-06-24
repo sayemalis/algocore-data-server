@@ -26,7 +26,7 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3001;
 const TIMEFRAMES = { "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
-const CANDLE_LIMIT = 200;
+const CANDLE_LIMIT = 1000; // Binance's max per single REST kline call — 4H: ~166 days, 1H: ~41 days, 1D: ~2.7 years, 1W: ~19 years
 
 const app = express();
 app.use(cors());
@@ -72,11 +72,20 @@ async function backfillCandles(symbol) {
   }
 }
 
-// ── Binance ticker WebSocket (combined stream, dynamic subscribe) ───────
+// ── Binance ticker WebSocket (single persistent connection, dynamic subscribe) ──
+// IMPORTANT: this connects ONCE and stays open. Adding a new tracked symbol
+// sends a SUBSCRIBE message on the existing socket — it does NOT tear down
+// and reopen the connection. Reconnecting per-symbol was the original bug
+// here: with hundreds of already-saved coins all calling ensureWSSubscribed
+// on every page load, each one triggered a full reconnect, so the socket
+// never settled into a stable subscribed state and most symbols silently
+// never got ticker pushes — forcing the frontend's REST fallback for nearly
+// everything instead of using this server's live feed at all.
 let binanceWS = null;
 let binanceConnecting = false;
 let reconnectTimer = null;
 let msgId = 1;
+const pendingSubscribes = new Set(); // queued while socket is still connecting
 
 function streamNameFor(symbol) {
   return `${symbol.toLowerCase()}@ticker`;
@@ -84,26 +93,31 @@ function streamNameFor(symbol) {
 function klineStreamNamesFor(symbol) {
   return Object.keys(TIMEFRAMES).map((tf) => `${symbol.toLowerCase()}@kline_${tf}`);
 }
+function streamsForSymbol(symbol) {
+  return [streamNameFor(symbol), ...klineStreamNamesFor(symbol)];
+}
 
 function connectBinance() {
-  if (binanceConnecting) return;
+  if (binanceConnecting || (binanceWS && binanceWS.readyState === WebSocket.OPEN)) return;
   binanceConnecting = true;
 
   const streams = [];
-  trackedSymbols.forEach((s) => {
-    streams.push(streamNameFor(s));
-    streams.push(...klineStreamNamesFor(s));
-  });
+  trackedSymbols.forEach((s) => streams.push(...streamsForSymbol(s)));
   const url =
     "wss://stream.binance.com:9443/stream?streams=" +
     (streams.length ? streams.join("/") : "btcusdt@ticker");
 
-  try { binanceWS?.close(); } catch {}
   binanceWS = new WebSocket(url);
 
   binanceWS.on("open", () => {
     binanceConnecting = false;
     console.log(`[Binance WS] connected — ${trackedSymbols.size} symbols, ${streams.length} streams`);
+    // Flush anything that was added while we were still connecting
+    if (pendingSubscribes.size) {
+      const params = [...pendingSubscribes].flatMap(streamsForSymbol);
+      binanceWS.send(JSON.stringify({ method: "SUBSCRIBE", params, id: msgId++ }));
+      pendingSubscribes.clear();
+    }
   });
 
   binanceWS.on("message", (raw) => {
@@ -158,11 +172,57 @@ function connectBinance() {
 
   binanceWS.on("close", () => {
     binanceConnecting = false;
+    binanceWS = null;
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectBinance, 3000);
   });
 
   binanceWS.on("error", () => { try { binanceWS.close(); } catch {} });
+}
+
+// ── Subscribe/unsubscribe a single symbol on the EXISTING socket ────────
+// This is the fix: adding/removing one symbol never tears down the shared
+// connection. If the socket isn't open yet, the symbol is queued and gets
+// flushed in one batched SUBSCRIBE once the connection opens (see above).
+function subscribeSymbol(symbol) {
+  if (!binanceWS || binanceWS.readyState !== WebSocket.OPEN) {
+    pendingSubscribes.add(symbol);
+    connectBinance();
+    return;
+  }
+  binanceWS.send(JSON.stringify({ method: "SUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ }));
+}
+
+function unsubscribeSymbol(symbol) {
+  pendingSubscribes.delete(symbol);
+  if (binanceWS && binanceWS.readyState === WebSocket.OPEN) {
+    binanceWS.send(JSON.stringify({ method: "UNSUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ }));
+  }
+}
+
+// ── REST backfill concurrency limiter ────────────────────────────────────
+// Without this, N simultaneous POST /api/coins requests (e.g. 293 already-
+// saved coins all hitting this endpoint on one page load) would fire N×6
+// concurrent REST calls at Binance from this server's single IP — a real
+// risk of a 418 rate-limit ban on the SERVER itself, which would then break
+// candle data for every connected client at once. Caps how many symbols'
+// backfills run at the same time; the rest simply wait their turn.
+const MAX_CONCURRENT_BACKFILLS = 3;
+let activeBackfills = 0;
+const backfillQueue = [];
+function runBackfillQueued(symbol) {
+  return new Promise((resolve) => {
+    const task = async () => {
+      activeBackfills++;
+      try { await backfillCandles(symbol); } finally {
+        activeBackfills--;
+        resolve();
+        if (backfillQueue.length) backfillQueue.shift()();
+      }
+    };
+    if (activeBackfills < MAX_CONCURRENT_BACKFILLS) task();
+    else backfillQueue.push(task);
+  });
 }
 
 // ── Public API ────────────────────────────────────────────────────────────
@@ -181,10 +241,10 @@ app.post("/api/coins", async (req, res) => {
   if (trackedSymbols.has(symbol)) return res.json({ ok: true, alreadyTracked: true });
 
   trackedSymbols.add(symbol);
-  await backfillCandles(symbol); // one-time REST cost, same as before — just done once server-side, not per browser tab
-  connectBinance(); // reconnect with the updated stream list
+  subscribeSymbol(symbol); // live stream starts immediately — doesn't wait on backfill
+  res.json({ ok: true, queued: true }); // respond right away; backfill runs in the background below
 
-  res.json({ ok: true });
+  runBackfillQueued(symbol).catch((err) => console.error(`[backfill] ${symbol} failed:`, err.message));
 });
 
 app.delete("/api/coins/:symbol", (req, res) => {
@@ -192,7 +252,7 @@ app.delete("/api/coins/:symbol", (req, res) => {
   trackedSymbols.delete(symbol);
   delete tickers[symbol];
   delete candles[symbol];
-  connectBinance();
+  unsubscribeSymbol(symbol);
   res.json({ ok: true });
 });
 
