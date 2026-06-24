@@ -35,9 +35,9 @@ const CANDLE_LIMITS = {
   "5m": 288,  // last 24h (288 × 5m)
   "15m": 96,  // last 24h (96 × 15m)
   "1h": 1000, // ~41.7 days
-  "4h": 2190, // 1 year exactly (365 × 24h / 4h) — primary decision TF
+  "4h": 1500, // ~250 days (~8.2 months) — primary decision TF
   "1d": 500,  // ~1.37 years
-  "1w": 300,  // ~5.76 years
+  "1w": 200,  // ~3.84 years
 };
 const CANDLE_LIMIT = 1000; // legacy fallback for any TF not in CANDLE_LIMITS
 
