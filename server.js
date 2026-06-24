@@ -25,7 +25,7 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3001;
-const TIMEFRAMES = { "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
+const TIMEFRAMES = { "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
 const CANDLE_LIMIT = 1000; // Binance's max per single REST kline call — 4H: ~166 days, 1H: ~41 days, 1D: ~2.7 years, 1W: ~19 years
 
 const app = express();
