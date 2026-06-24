@@ -25,14 +25,18 @@ const http = require("http");
 const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3001;
-const TIMEFRAMES = { "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
+const TIMEFRAMES = { "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
 // Per-timeframe candle caps — 4H gets the deepest history since trade
 // decisions are made there; 1D/1W are only used for HTF/weekly bias
 // context, not deep structure, so they're capped much shallower.
+// 5m/15m are "latest only" — last 24h, display use only, not used by the
+// signal engine or kNN anymore.
 const CANDLE_LIMITS = {
-  "1h": 1500, // ~62.5 days
-  "4h": 2500, // ~417 days (~14 months) — primary decision TF, deepest history
-  "1d": 750,  // ~2.05 years
+  "5m": 288,  // last 24h (288 × 5m)
+  "15m": 96,  // last 24h (96 × 15m)
+  "1h": 1000, // ~41.7 days
+  "4h": 2190, // 1 year exactly (365 × 24h / 4h) — primary decision TF
+  "1d": 500,  // ~1.37 years
   "1w": 300,  // ~5.76 years
 };
 const CANDLE_LIMIT = 1000; // legacy fallback for any TF not in CANDLE_LIMITS
