@@ -26,7 +26,16 @@ const WebSocket = require("ws");
 
 const PORT = process.env.PORT || 3001;
 const TIMEFRAMES = { "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
-const CANDLE_LIMIT = 1000; // Binance's max per single REST kline call — 4H: ~166 days, 1H: ~41 days, 1D: ~2.7 years, 1W: ~19 years
+// Per-timeframe candle caps — 4H gets the deepest history since trade
+// decisions are made there; 1D/1W are only used for HTF/weekly bias
+// context, not deep structure, so they're capped much shallower.
+const CANDLE_LIMITS = {
+  "1h": 1500, // ~62.5 days
+  "4h": 2500, // ~417 days (~14 months) — primary decision TF, deepest history
+  "1d": 750,  // ~2.05 years
+  "1w": 300,  // ~5.76 years
+};
+const CANDLE_LIMIT = 1000; // legacy fallback for any TF not in CANDLE_LIMITS
 
 const app = express();
 app.use(cors());
@@ -52,9 +61,10 @@ function broadcast(msg) {
 async function backfillCandles(symbol) {
   candles[symbol] = candles[symbol] || {};
   for (const [tf, _secs] of Object.entries(TIMEFRAMES)) {
+    const limit = CANDLE_LIMITS[tf] || CANDLE_LIMIT;
     try {
       const res = await fetch(
-        `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=${CANDLE_LIMIT}`
+        `https://data-api.binance.vision/api/v3/klines?symbol=${symbol}&interval=${tf}&limit=${limit}`
       );
       const raw = await res.json();
       candles[symbol][tf] = raw.map((c) => ({
@@ -159,7 +169,8 @@ function connectBinance() {
           arr[arr.length - 1] = candle; // update open candle in place
         } else if (k.x) {
           arr.push(candle); // closed candle, new bucket
-          if (arr.length > CANDLE_LIMIT) arr.shift();
+          const limit = CANDLE_LIMITS[tf] || CANDLE_LIMIT;
+          if (arr.length > limit) arr.shift();
         } else {
           arr.push(candle);
         }
