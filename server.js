@@ -32,8 +32,8 @@ const TIMEFRAMES = { "5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400
 // 5m/15m are "latest only" — last 24h, display use only, not used by the
 // signal engine or kNN anymore.
 const CANDLE_LIMITS = {
-  "5m": 288,  // last 24h (288 × 5m)
-  "15m": 96,  // last 24h (96 × 15m)
+  "5m": 12,   // last 1h (12 × 5m)
+  "15m": 4,   // last 1h (4 × 15m)
   "1h": 1000, // ~41.7 days
   "4h": 1500, // ~250 days (~8.2 months) — primary decision TF
   "1d": 500,  // ~1.37 years
