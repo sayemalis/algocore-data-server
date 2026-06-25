@@ -270,19 +270,33 @@ app.delete("/api/coins/:symbol", (req, res) => {
 
 app.get("/api/snapshot/:symbol", (req, res) => {
   const symbol = req.params.symbol.toUpperCase();
+  const tf = req.query.tf; // optional — e.g. ?tf=4h
+  const allCandles = candles[symbol] || {};
+  // Without this filter, every single-TF cache-refresh on the client pulled
+  // the FULL multi-TF payload (every tracked timeframe, full depth) every
+  // time — measured at ~28GB over a few hours of real usage. Each TF has
+  // its own refresh cadence (5m/15m every 5min, 1H every 15min, etc.), so
+  // that meant re-downloading everything else redundantly on every single
+  // one of those refreshes. ?tf= lets the client ask for only what it
+  // actually needs right now.
+  const responseCandles = tf ? { [tf]: allCandles[tf] || [] } : allCandles;
   res.json({
     symbol,
     ticker: tickers[symbol] || null,
-    candles: candles[symbol] || {},
+    candles: responseCandles,
   });
 });
 
-// ── WebSocket: send a full snapshot on connect, then live updates ───────
+// ── WebSocket: send a ticker snapshot on connect, then live updates ─────
+// Candle data used to be included here too, but the client never actually
+// read it (only msg.tickers was ever consumed) — every single connect or
+// reconnect was silently transmitting the full multi-TF candle set for
+// every tracked symbol for nothing. That dead weight is gone; candles are
+// only ever fetched on-demand via GET /api/snapshot/:symbol?tf=... now.
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({
     type: "SNAPSHOT",
     tickers,
-    candles,
   }));
 });
 
