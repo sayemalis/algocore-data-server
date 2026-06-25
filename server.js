@@ -24,6 +24,22 @@ const cors = require("cors");
 const http = require("http");
 const WebSocket = require("ws");
 
+// ── Crash safety net ──────────────────────────────────────────────────────
+// Today's actual crash (an uncaught WebSocket.send() race in connectBinance,
+// now fixed below) took the ENTIRE process down on every occurrence — no
+// memory pressure involved, just a single unhandled throw. On a free-tier
+// instance, every crash means a cold restart + however long it takes to
+// re-track every symbol from scratch. These two handlers mean any FUTURE
+// stray error (a bug we haven't found yet) gets logged instead of killing
+// the whole server. This does not paper over the bug above — that's fixed
+// at the source — it's defense in depth for whatever's next.
+process.on("uncaughtException", (err) => {
+  console.error("[uncaughtException] survived:", err);
+});
+process.on("unhandledRejection", (err) => {
+  console.error("[unhandledRejection] survived:", err);
+});
+
 const PORT = process.env.PORT || 3001;
 const TIMEFRAMES = { "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
 // Per-timeframe candle caps — 4H gets the deepest history since trade
@@ -118,20 +134,31 @@ function connectBinance() {
     "wss://stream.binance.com:9443/stream?streams=" +
     (streams.length ? streams.join("/") : "btcusdt@ticker");
 
-  binanceWS = new WebSocket(url);
+  // Use a local `ws` reference throughout this function instead of always
+  // reading the mutable global `binanceWS`. Without this, an overlapping
+  // reconnect (e.g. this socket's "close"/"error" fires, a new connect
+  // attempt starts and reassigns the global, and THEN this socket's
+  // delayed "open" event finally fires) would call .send() on whatever
+  // socket the global currently points to — which can still be CONNECTING
+  // — throwing an uncaught exception that crashed the entire process.
+  const ws = new WebSocket(url);
+  binanceWS = ws;
 
-  binanceWS.on("open", () => {
+  ws.on("open", () => {
     binanceConnecting = false;
     console.log(`[Binance WS] connected — ${trackedSymbols.size} symbols, ${streams.length} streams`);
-    // Flush anything that was added while we were still connecting
-    if (pendingSubscribes.size) {
+    // Flush anything that was added while we were still connecting.
+    // Double-guarded: only act on THIS socket instance, and only if it's
+    // actually open (readyState can still change between the event firing
+    // and this callback running, in rare cases).
+    if (pendingSubscribes.size && ws.readyState === WebSocket.OPEN) {
       const params = [...pendingSubscribes].flatMap(streamsForSymbol);
-      binanceWS.send(JSON.stringify({ method: "SUBSCRIBE", params, id: msgId++ }));
+      ws.send(JSON.stringify({ method: "SUBSCRIBE", params, id: msgId++ }));
       pendingSubscribes.clear();
     }
   });
 
-  binanceWS.on("message", (raw) => {
+  ws.on("message", (raw) => {
     try {
       const msg = JSON.parse(raw);
       const data = msg.data || msg;
@@ -182,14 +209,17 @@ function connectBinance() {
     }
   });
 
-  binanceWS.on("close", () => {
+  ws.on("close", () => {
     binanceConnecting = false;
-    binanceWS = null;
+    // Only clear the global if THIS socket is still the active one — an
+    // overlapping reconnect may have already replaced it with a newer
+    // socket, and this stale close event must not null that out.
+    if (binanceWS === ws) binanceWS = null;
     clearTimeout(reconnectTimer);
     reconnectTimer = setTimeout(connectBinance, 3000);
   });
 
-  binanceWS.on("error", () => { try { binanceWS.close(); } catch {} });
+  ws.on("error", () => { try { ws.close(); } catch {} });
 }
 
 // ── Subscribe/unsubscribe a single symbol on the EXISTING socket ────────
