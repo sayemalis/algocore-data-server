@@ -41,16 +41,16 @@ process.on("unhandledRejection", (err) => {
 });
 
 const PORT = process.env.PORT || 3001;
-const TIMEFRAMES = { "1h": 3600, "4h": 14400, "1d": 86400, "1w": 604800 }; // interval -> seconds
+const TIMEFRAMES = { "4h": 14400, "1d": 86400 }; // interval -> seconds
 // Per-timeframe candle caps — 4H gets the deepest history since trade
-// decisions are made there; 1D/1W are only used for HTF/weekly bias
-// context, not deep structure, so they're capped much shallower.
-// 5m and 15m removed entirely — no chart tab, no backend use.
+// decisions are made there; 1D is only used for HTF bias context, not
+// deep structure, so it's capped much shallower.
+// 5m, 15m, 1h, and 1w removed entirely — no chart tab, no backend use
+// (1H/1W chart tabs and the weekly-bias feature were both removed since
+// neither ever actually gated a trade decision).
 const CANDLE_LIMITS = {
-  "1h": 720,  // 1 month exactly (30 × 24h / 1h)
   "4h": 1200, // ~200 days — primary decision TF
   "1d": 400,  // ~1.1 years
-  "1w": 100,  // ~1.92 years
 };
 const CANDLE_LIMIT = 1000; // legacy fallback for any TF not in CANDLE_LIMITS
 
