@@ -222,6 +222,33 @@ function connectBinance() {
   ws.on("error", () => { try { ws.close(); } catch {} });
 }
 
+// ── Rate-limited send queue for Binance control messages ─────────────────
+// Binance disconnects any connection that receives more than 5 messages/sec
+// (this counts SUBSCRIBE/UNSUBSCRIBE, not just data) — repeated violations
+// risk an IP-level penalty. Each subscribeSymbol() call below used to call
+// binanceWS.send() immediately and unconditionally: on a fresh page load
+// with 70-100+ tracked coins all subscribing in a tight burst, that's easily
+// 10-20+ SUBSCRIBE messages landing in under a second, blowing past the
+// limit and getting this connection disconnected mid-burst. Whatever
+// symbols were already baked into a stream URL (boot, or post-reconnect)
+// kept working; everything still mid-subscribe when the disconnect hit
+// silently lost its live feed — matching the "first ~70 update, the rest
+// never do" symptom exactly. Fix: queue every send and drain it at a safe,
+// steady rate instead of firing them all at once.
+const SEND_RATE_MS = 250; // 4/sec — comfortable margin under Binance's 5/sec hard limit
+const sendQueue = [];
+let sendTimer = null;
+function queueBinanceSend(payload) {
+  sendQueue.push(payload);
+  if (!sendTimer) sendTimer = setInterval(drainSendQueue, SEND_RATE_MS);
+}
+function drainSendQueue() {
+  if (!sendQueue.length) { clearInterval(sendTimer); sendTimer = null; return; }
+  if (!binanceWS || binanceWS.readyState !== WebSocket.OPEN) return; // wait for reconnect, don't drop the queue
+  const payload = sendQueue.shift();
+  try { binanceWS.send(JSON.stringify(payload)); } catch { /* connection dropped mid-send, will retry via reconnect */ }
+}
+
 // ── Subscribe/unsubscribe a single symbol on the EXISTING socket ────────
 // This is the fix: adding/removing one symbol never tears down the shared
 // connection. If the socket isn't open yet, the symbol is queued and gets
@@ -232,13 +259,13 @@ function subscribeSymbol(symbol) {
     connectBinance();
     return;
   }
-  binanceWS.send(JSON.stringify({ method: "SUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ }));
+  queueBinanceSend({ method: "SUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ });
 }
 
 function unsubscribeSymbol(symbol) {
   pendingSubscribes.delete(symbol);
   if (binanceWS && binanceWS.readyState === WebSocket.OPEN) {
-    binanceWS.send(JSON.stringify({ method: "UNSUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ }));
+    queueBinanceSend({ method: "UNSUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ });
   }
 }
 
