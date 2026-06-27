@@ -304,10 +304,36 @@ app.get("/api/coins", (_req, res) => {
   res.json({ symbols: [...trackedSymbols] });
 });
 
+// ── Tracked-symbol cap ───────────────────────────────────────────────────
+// Binance hard-disconnects (or silently ignores subscribes beyond) 1024
+// streams per connection. Each tracked symbol uses 3 streams (ticker +
+// kline_4h + kline_1d). Without a cap, trackedSymbols only ever grows —
+// nothing previously removed a symbol unless a client explicitly called
+// DELETE for it, and the continuous live auto-scanner just keeps adding
+// newly-qualifying coins on top of whatever's already there. Over enough
+// uptime this silently crosses the 1024-stream ceiling: symbols that got
+// subscribed before crossing it keep working, everything after never gets
+// live data — exactly the "only the first N coins update" symptom. Cap at
+// 300 symbols (900 streams, comfortable margin under 1024) and evict the
+// oldest-tracked symbol (Sets preserve insertion order, so this is a cheap
+// FIFO) to make room for new ones instead of growing forever.
+const MAX_TRACKED_SYMBOLS = 300;
+function evictOldestSymbol() {
+  const oldest = trackedSymbols.values().next().value;
+  if (!oldest) return;
+  trackedSymbols.delete(oldest);
+  delete tickers[oldest];
+  delete candles[oldest];
+  unsubscribeSymbol(oldest);
+  console.log(`[evict] ${oldest} dropped to stay under the stream cap`);
+}
+
 app.post("/api/coins", async (req, res) => {
   const symbol = (req.body?.symbol || "").toUpperCase();
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   if (trackedSymbols.has(symbol)) return res.json({ ok: true, alreadyTracked: true });
+
+  if (trackedSymbols.size >= MAX_TRACKED_SYMBOLS) evictOldestSymbol();
 
   trackedSymbols.add(symbol);
   subscribeSymbol(symbol); // live stream starts immediately — doesn't wait on backfill
