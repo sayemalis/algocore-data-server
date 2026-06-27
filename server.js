@@ -25,14 +25,13 @@ const http = require("http");
 const WebSocket = require("ws");
 
 // ── Crash safety net ──────────────────────────────────────────────────────
-// Today's actual crash (an uncaught WebSocket.send() race in connectBinance,
-// now fixed below) took the ENTIRE process down on every occurrence — no
-// memory pressure involved, just a single unhandled throw. On a free-tier
-// instance, every crash means a cold restart + however long it takes to
-// re-track every symbol from scratch. These two handlers mean any FUTURE
-// stray error (a bug we haven't found yet) gets logged instead of killing
-// the whole server. This does not paper over the bug above — that's fixed
-// at the source — it's defense in depth for whatever's next.
+// An earlier uncaught WebSocket.send() race in the connection logic took
+// the ENTIRE process down on every occurrence — no memory pressure
+// involved, just a single unhandled throw. On a free-tier instance, every
+// crash means a cold restart + however long it takes to re-track every
+// symbol from scratch. These two handlers mean any FUTURE stray error (a
+// bug not yet found) gets logged instead of killing the whole server. This
+// does not paper over bugs — it's defense in depth for whatever's next.
 process.on("uncaughtException", (err) => {
   console.error("[uncaughtException] survived:", err);
 });
@@ -64,7 +63,7 @@ const wss = new WebSocket.Server({ server, path: "/ws" });
 // ── In-memory state ──────────────────────────────────────────────────────
 const tickers = {};          // symbol -> { price, changePct, high, low, ts }
 const candles = {};          // symbol -> { [tf]: [{time,open,high,low,close,volume}] }
-const trackedSymbols = new Set();
+const trackedSymbols = new Set(); // every symbol tracked, across all shards combined
 
 // ── Broadcast helper — push to every connected frontend client ──────────
 function broadcast(msg) {
@@ -99,21 +98,6 @@ async function backfillCandles(symbol) {
   }
 }
 
-// ── Binance ticker WebSocket (single persistent connection, dynamic subscribe) ──
-// IMPORTANT: this connects ONCE and stays open. Adding a new tracked symbol
-// sends a SUBSCRIBE message on the existing socket — it does NOT tear down
-// and reopen the connection. Reconnecting per-symbol was the original bug
-// here: with hundreds of already-saved coins all calling ensureWSSubscribed
-// on every page load, each one triggered a full reconnect, so the socket
-// never settled into a stable subscribed state and most symbols silently
-// never got ticker pushes — forcing the frontend's REST fallback for nearly
-// everything instead of using this server's live feed at all.
-let binanceWS = null;
-let binanceConnecting = false;
-let reconnectTimer = null;
-let msgId = 1;
-const pendingSubscribes = new Set(); // queued while socket is still connecting
-
 function streamNameFor(symbol) {
   return `${symbol.toLowerCase()}@ticker`;
 }
@@ -124,37 +108,70 @@ function streamsForSymbol(symbol) {
   return [streamNameFor(symbol), ...klineStreamNamesFor(symbol)];
 }
 
-function connectBinance() {
-  if (binanceConnecting || (binanceWS && binanceWS.readyState === WebSocket.OPEN)) return;
-  binanceConnecting = true;
+// ── Sharded Binance connections ───────────────────────────────────────────
+// Binance hard-disconnects any single connection that exceeds 1024 streams,
+// and each tracked symbol uses 3 streams (ticker + kline_4h + kline_1d).
+// A single connection therefore tops out at ~341 symbols — comfortably
+// exceeded by real usage (432+ manually-tracked coins). The previous fix
+// for this was a hard cap with FIFO eviction, which "worked" only by
+// actively dropping live data for coins the person specifically chose to
+// track — actively wrong for anyone tracking more than ~300-340 coins.
+// The actual fix: multiple independent Binance connections ("shards"),
+// each capped well under the 1024-stream ceiling, all feeding the same
+// shared tickers/candles cache and broadcasting to the same connected
+// frontend clients. Adding symbol #301 just spins up a second shard
+// instead of evicting symbol #1.
+const SHARD_CAPACITY = 300; // symbols per shard — 900 streams, safe margin under 1024
+const shards = []; // [{ id, ws, connecting, reconnectTimer, pendingSubscribes, symbols, sendQueue, sendTimer }]
+const symbolToShard = new Map(); // symbol -> shard, for O(1) routing on unsubscribe
+
+function createShard() {
+  const shard = {
+    id: shards.length,
+    ws: null,
+    connecting: false,
+    reconnectTimer: null,
+    pendingSubscribes: new Set(),
+    symbols: new Set(),
+    sendQueue: [],
+    sendTimer: null,
+  };
+  shards.push(shard);
+  return shard;
+}
+
+function shardForNewSymbol() {
+  let shard = shards.find((s) => s.symbols.size < SHARD_CAPACITY);
+  if (!shard) shard = createShard();
+  return shard;
+}
+
+function connectShard(shard) {
+  if (shard.connecting || (shard.ws && shard.ws.readyState === WebSocket.OPEN)) return;
+  shard.connecting = true;
 
   const streams = [];
-  trackedSymbols.forEach((s) => streams.push(...streamsForSymbol(s)));
+  shard.symbols.forEach((s) => streams.push(...streamsForSymbol(s)));
   const url =
     "wss://stream.binance.com:9443/stream?streams=" +
     (streams.length ? streams.join("/") : "btcusdt@ticker");
 
-  // Use a local `ws` reference throughout this function instead of always
-  // reading the mutable global `binanceWS`. Without this, an overlapping
-  // reconnect (e.g. this socket's "close"/"error" fires, a new connect
-  // attempt starts and reassigns the global, and THEN this socket's
-  // delayed "open" event finally fires) would call .send() on whatever
-  // socket the global currently points to — which can still be CONNECTING
-  // — throwing an uncaught exception that crashed the entire process.
+  // Local `ws` reference used throughout, not the mutable shard.ws field —
+  // an overlapping reconnect (this socket's close/error fires, a new
+  // connect attempt starts and reassigns shard.ws, and THEN this socket's
+  // delayed open event finally fires) would otherwise call .send() on
+  // whatever shard.ws currently points to, which can still be CONNECTING —
+  // an uncaught exception that crashed the entire process previously.
   const ws = new WebSocket(url);
-  binanceWS = ws;
+  shard.ws = ws;
 
   ws.on("open", () => {
-    binanceConnecting = false;
-    console.log(`[Binance WS] connected — ${trackedSymbols.size} symbols, ${streams.length} streams`);
-    // Flush anything that was added while we were still connecting.
-    // Double-guarded: only act on THIS socket instance, and only if it's
-    // actually open (readyState can still change between the event firing
-    // and this callback running, in rare cases).
-    if (pendingSubscribes.size && ws.readyState === WebSocket.OPEN) {
-      const params = [...pendingSubscribes].flatMap(streamsForSymbol);
-      ws.send(JSON.stringify({ method: "SUBSCRIBE", params, id: msgId++ }));
-      pendingSubscribes.clear();
+    shard.connecting = false;
+    console.log(`[Binance WS shard ${shard.id}] connected — ${shard.symbols.size} symbols, ${streams.length} streams`);
+    if (shard.pendingSubscribes.size && ws.readyState === WebSocket.OPEN) {
+      const params = [...shard.pendingSubscribes].flatMap(streamsForSymbol);
+      ws.send(JSON.stringify({ method: "SUBSCRIBE", params, id: nextMsgId() }));
+      shard.pendingSubscribes.clear();
     }
   });
 
@@ -179,7 +196,7 @@ function connectBinance() {
 
       if (data.e === "kline") {
         const k = data.k;
-        const tf = k.i; // e.g. "15m"
+        const tf = k.i;
         const symbol = k.s;
         if (!candles[symbol]) candles[symbol] = {};
         if (!candles[symbol][tf]) candles[symbol][tf] = [];
@@ -210,72 +227,73 @@ function connectBinance() {
   });
 
   ws.on("close", () => {
-    binanceConnecting = false;
-    // Only clear the global if THIS socket is still the active one — an
-    // overlapping reconnect may have already replaced it with a newer
-    // socket, and this stale close event must not null that out.
-    if (binanceWS === ws) binanceWS = null;
-    clearTimeout(reconnectTimer);
-    reconnectTimer = setTimeout(connectBinance, 3000);
+    shard.connecting = false;
+    if (shard.ws === ws) shard.ws = null;
+    clearTimeout(shard.reconnectTimer);
+    shard.reconnectTimer = setTimeout(() => connectShard(shard), 3000);
   });
 
   ws.on("error", () => { try { ws.close(); } catch {} });
 }
 
-// ── Rate-limited send queue for Binance control messages ─────────────────
-// Binance disconnects any connection that receives more than 5 messages/sec
-// (this counts SUBSCRIBE/UNSUBSCRIBE, not just data) — repeated violations
-// risk an IP-level penalty. Each subscribeSymbol() call below used to call
-// binanceWS.send() immediately and unconditionally: on a fresh page load
-// with 70-100+ tracked coins all subscribing in a tight burst, that's easily
-// 10-20+ SUBSCRIBE messages landing in under a second, blowing past the
-// limit and getting this connection disconnected mid-burst. Whatever
-// symbols were already baked into a stream URL (boot, or post-reconnect)
-// kept working; everything still mid-subscribe when the disconnect hit
-// silently lost its live feed — matching the "first ~70 update, the rest
-// never do" symptom exactly. Fix: queue every send and drain it at a safe,
-// steady rate instead of firing them all at once.
-const SEND_RATE_MS = 250; // 4/sec — comfortable margin under Binance's 5/sec hard limit
-const sendQueue = [];
-let sendTimer = null;
-function queueBinanceSend(payload) {
-  sendQueue.push(payload);
-  if (!sendTimer) sendTimer = setInterval(drainSendQueue, SEND_RATE_MS);
+// ── Rate-limited send queue, per shard ────────────────────────────────────
+// Binance disconnects any connection receiving more than 5 messages/sec
+// (counts SUBSCRIBE/UNSUBSCRIBE, not just data) — repeated violations risk
+// an IP-level penalty. A burst of many coins subscribing at once easily
+// exceeds that if sent immediately and unconditionally. Each shard is a
+// SEPARATE Binance connection with its own independent 5/sec budget, so
+// each gets its own queue/timer rather than sharing one globally.
+const SEND_RATE_MS = 250; // 4/sec per shard — comfortable margin under Binance's 5/sec hard limit
+let _msgId = 1;
+function nextMsgId() { return _msgId++; }
+
+function queueShardSend(shard, payload) {
+  shard.sendQueue.push(payload);
+  if (!shard.sendTimer) shard.sendTimer = setInterval(() => drainShardQueue(shard), SEND_RATE_MS);
 }
-function drainSendQueue() {
-  if (!sendQueue.length) { clearInterval(sendTimer); sendTimer = null; return; }
-  if (!binanceWS || binanceWS.readyState !== WebSocket.OPEN) return; // wait for reconnect, don't drop the queue
-  const payload = sendQueue.shift();
-  try { binanceWS.send(JSON.stringify(payload)); } catch { /* connection dropped mid-send, will retry via reconnect */ }
+function drainShardQueue(shard) {
+  if (!shard.sendQueue.length) { clearInterval(shard.sendTimer); shard.sendTimer = null; return; }
+  if (!shard.ws || shard.ws.readyState !== WebSocket.OPEN) return; // wait for reconnect, don't drop the queue
+  const payload = shard.sendQueue.shift();
+  try { shard.ws.send(JSON.stringify(payload)); } catch { /* connection dropped mid-send, will retry via reconnect */ }
 }
 
-// ── Subscribe/unsubscribe a single symbol on the EXISTING socket ────────
-// This is the fix: adding/removing one symbol never tears down the shared
-// connection. If the socket isn't open yet, the symbol is queued and gets
-// flushed in one batched SUBSCRIBE once the connection opens (see above).
+// ── Subscribe/unsubscribe a single symbol ────────────────────────────────
+// Routes to whichever shard owns the symbol (existing) or has room (new).
+// Adding/removing one symbol never tears down its shard's connection.
 function subscribeSymbol(symbol) {
-  if (!binanceWS || binanceWS.readyState !== WebSocket.OPEN) {
-    pendingSubscribes.add(symbol);
-    connectBinance();
+  let shard = symbolToShard.get(symbol);
+  if (!shard) {
+    shard = shardForNewSymbol();
+    shard.symbols.add(symbol);
+    symbolToShard.set(symbol, shard);
+  }
+  if (!shard.ws || shard.ws.readyState !== WebSocket.OPEN) {
+    shard.pendingSubscribes.add(symbol);
+    connectShard(shard);
     return;
   }
-  queueBinanceSend({ method: "SUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ });
+  queueShardSend(shard, { method: "SUBSCRIBE", params: streamsForSymbol(symbol), id: nextMsgId() });
 }
 
 function unsubscribeSymbol(symbol) {
-  pendingSubscribes.delete(symbol);
-  if (binanceWS && binanceWS.readyState === WebSocket.OPEN) {
-    queueBinanceSend({ method: "UNSUBSCRIBE", params: streamsForSymbol(symbol), id: msgId++ });
+  const shard = symbolToShard.get(symbol);
+  if (!shard) return;
+  shard.symbols.delete(symbol);
+  shard.pendingSubscribes.delete(symbol);
+  symbolToShard.delete(symbol);
+  if (shard.ws && shard.ws.readyState === WebSocket.OPEN) {
+    queueShardSend(shard, { method: "UNSUBSCRIBE", params: streamsForSymbol(symbol), id: nextMsgId() });
   }
 }
 
 // ── REST backfill concurrency limiter ────────────────────────────────────
-// Without this, N simultaneous POST /api/coins requests (e.g. 293 already-
-// saved coins all hitting this endpoint on one page load) would fire N×6
-// concurrent REST calls at Binance from this server's single IP — a real
-// risk of a 418 rate-limit ban on the SERVER itself, which would then break
-// candle data for every connected client at once. Caps how many symbols'
-// backfills run at the same time; the rest simply wait their turn.
+// Without this, N simultaneous POST /api/coins requests (e.g. hundreds of
+// already-saved coins all hitting this endpoint on one page load) would
+// fire N×2 concurrent REST calls at Binance from this server's single IP —
+// a real risk of a 418 rate-limit ban on the SERVER itself, which would
+// then break candle data for every connected client at once. Caps how many
+// symbols' backfills run at the same time; the rest simply wait their turn.
 const MAX_CONCURRENT_BACKFILLS = 3;
 let activeBackfills = 0;
 const backfillQueue = [];
@@ -297,43 +315,22 @@ function runBackfillQueued(symbol) {
 // ── Public API ────────────────────────────────────────────────────────────
 
 app.get("/health", (_req, res) => {
-  res.json({ ok: true, trackedSymbols: trackedSymbols.size, uptimeSec: process.uptime() });
+  res.json({
+    ok: true,
+    trackedSymbols: trackedSymbols.size,
+    shards: shards.map((s) => ({ id: s.id, symbols: s.symbols.size, connected: s.ws?.readyState === WebSocket.OPEN })),
+    uptimeSec: process.uptime(),
+  });
 });
 
 app.get("/api/coins", (_req, res) => {
   res.json({ symbols: [...trackedSymbols] });
 });
 
-// ── Tracked-symbol cap ───────────────────────────────────────────────────
-// Binance hard-disconnects (or silently ignores subscribes beyond) 1024
-// streams per connection. Each tracked symbol uses 3 streams (ticker +
-// kline_4h + kline_1d). Without a cap, trackedSymbols only ever grows —
-// nothing previously removed a symbol unless a client explicitly called
-// DELETE for it, and the continuous live auto-scanner just keeps adding
-// newly-qualifying coins on top of whatever's already there. Over enough
-// uptime this silently crosses the 1024-stream ceiling: symbols that got
-// subscribed before crossing it keep working, everything after never gets
-// live data — exactly the "only the first N coins update" symptom. Cap at
-// 300 symbols (900 streams, comfortable margin under 1024) and evict the
-// oldest-tracked symbol (Sets preserve insertion order, so this is a cheap
-// FIFO) to make room for new ones instead of growing forever.
-const MAX_TRACKED_SYMBOLS = 300;
-function evictOldestSymbol() {
-  const oldest = trackedSymbols.values().next().value;
-  if (!oldest) return;
-  trackedSymbols.delete(oldest);
-  delete tickers[oldest];
-  delete candles[oldest];
-  unsubscribeSymbol(oldest);
-  console.log(`[evict] ${oldest} dropped to stay under the stream cap`);
-}
-
 app.post("/api/coins", async (req, res) => {
   const symbol = (req.body?.symbol || "").toUpperCase();
   if (!symbol) return res.status(400).json({ error: "symbol required" });
   if (trackedSymbols.has(symbol)) return res.json({ ok: true, alreadyTracked: true });
-
-  if (trackedSymbols.size >= MAX_TRACKED_SYMBOLS) evictOldestSymbol();
 
   trackedSymbols.add(symbol);
   subscribeSymbol(symbol); // live stream starts immediately — doesn't wait on backfill
@@ -357,11 +354,7 @@ app.get("/api/snapshot/:symbol", (req, res) => {
   const allCandles = candles[symbol] || {};
   // Without this filter, every single-TF cache-refresh on the client pulled
   // the FULL multi-TF payload (every tracked timeframe, full depth) every
-  // time — measured at ~28GB over a few hours of real usage. Each TF has
-  // its own refresh cadence (5m/15m every 5min, 1H every 15min, etc.), so
-  // that meant re-downloading everything else redundantly on every single
-  // one of those refreshes. ?tf= lets the client ask for only what it
-  // actually needs right now.
+  // time. ?tf= lets the client ask for only what it actually needs right now.
   const responseCandles = tf ? { [tf]: allCandles[tf] || [] } : allCandles;
   res.json({
     symbol,
@@ -371,11 +364,6 @@ app.get("/api/snapshot/:symbol", (req, res) => {
 });
 
 // ── WebSocket: send a ticker snapshot on connect, then live updates ─────
-// Candle data used to be included here too, but the client never actually
-// read it (only msg.tickers was ever consumed) — every single connect or
-// reconnect was silently transmitting the full multi-TF candle set for
-// every tracked symbol for nothing. That dead weight is gone; candles are
-// only ever fetched on-demand via GET /api/snapshot/:symbol?tf=... now.
 wss.on("connection", (ws) => {
   ws.send(JSON.stringify({
     type: "SNAPSHOT",
@@ -386,11 +374,11 @@ wss.on("connection", (ws) => {
 // ── Boot ──────────────────────────────────────────────────────────────────
 server.listen(PORT, () => {
   console.log(`[algocore-data-server] listening on port ${PORT}`);
-  // Seed with a default coin so the WS connection has something to do on
+  // Seed with a default coin so the first shard has something to do on
   // boot even before the frontend adds anything — adjust/remove as needed.
   (async () => {
     trackedSymbols.add("BTCUSDT");
     await backfillCandles("BTCUSDT");
-    connectBinance();
+    subscribeSymbol("BTCUSDT");
   })();
 });
